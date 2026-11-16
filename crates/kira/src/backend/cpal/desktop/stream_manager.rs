@@ -26,6 +26,9 @@ enum State {
 	Idle {
 		renderer: RendererWithCpuUsage,
 	},
+	Recovering {
+		renderer_consumer: Consumer<RendererWithCpuUsage>,
+	},
 	Running {
 		stream: Stream,
 		renderer_consumer: Consumer<RendererWithCpuUsage>,
@@ -143,50 +146,47 @@ impl StreamManager {
 		handled_stream_error_producer: &mut Producer<cpal::Error>,
 		num_stream_errors_discarded: &Arc<AtomicU64>,
 	) {
-		if let State::Running { .. } = &self.state {
-			while let Ok(error) = unhandled_stream_error_consumer.pop() {
-				match error.kind() {
-					// check for device disconnection
-					cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => {
-						self.stop_stream();
-						if let Ok((device, mut config)) = default_device_and_config() {
-							// TODO: gracefully handle errors that occur in this function
-							*unhandled_stream_error_consumer = self
-								.start_stream(
-									&device,
-									&mut config,
-									num_stream_errors_discarded.clone(),
-								)
-								.unwrap();
-						}
-					}
-					// cpal::ErrorKind::BackendSpecific { err: _ } | StreamError::BufferUnderrun => {}
-					_ => {}
-				}
-				match handled_stream_error_producer.push(error) {
-					Ok(()) => {}
-					Err(PushError::Full(_stream_error)) => {
-						num_stream_errors_discarded.fetch_add(1, Ordering::AcqRel);
-					}
-				}
+		let mut report = |error| {
+			if handled_stream_error_producer.push(error).is_err() {
+				num_stream_errors_discarded.fetch_add(1, Ordering::AcqRel);
 			}
-			// check for device changes if a custom device hasn't been specified
-			// Disabled on macos due to audio artifacts that seem to occur when the device is
-			// queried while playing.
-			// see: https://github.com/tesselode/kira/issues/38
-			#[cfg(not(target_os = "macos"))]
-			if !self.custom_device {
-				if let Ok((device, mut config)) = default_device_and_config() {
-					let device_id = device_id(&device);
-					let sample_rate = config.sample_rate;
-					if device_id != self.device_id || sample_rate != self.sample_rate {
-						self.stop_stream();
-						*unhandled_stream_error_consumer = self
-							.start_stream(&device, &mut config, num_stream_errors_discarded.clone())
-							.unwrap();
-					}
-				}
+		};
+		let mut disconnected = false;
+		while let Ok(error) = unhandled_stream_error_consumer.pop() {
+			disconnected |= matches!(
+				error.kind(),
+				cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated
+			);
+			report(error);
+		}
+		if disconnected && matches!(self.state, State::Running { .. }) {
+			self.stop_stream();
+		}
+
+		// Avoid querying a healthy custom device or interrupting playback on macOS (#38).
+		if matches!(self.state, State::Running { .. })
+			&& (self.custom_device || cfg!(target_os = "macos"))
+		{
+			return;
+		}
+		let Ok((device, mut config)) = default_device_and_config() else {
+			return;
+		};
+		if matches!(self.state, State::Running { .. }) {
+			if device_id(&device) == self.device_id && config.sample_rate == self.sample_rate {
+				return;
 			}
+			self.stop_stream();
+		}
+		if let State::Recovering { renderer_consumer } = &mut self.state {
+			let Ok(renderer) = renderer_consumer.pop() else {
+				return;
+			};
+			self.state = State::Idle { renderer };
+		}
+		match self.start_stream(&device, &mut config, num_stream_errors_discarded.clone()) {
+			Ok(consumer) => *unhandled_stream_error_consumer = consumer,
+			Err(error) => report(error),
 		}
 	}
 
@@ -195,7 +195,7 @@ impl StreamManager {
 		device: &Device,
 		config: &mut StreamConfig,
 		num_stream_errors_discarded: Arc<AtomicU64>,
-	) -> Result<Consumer<cpal::Error>, Error> {
+	) -> Result<Consumer<cpal::Error>, cpal::Error> {
 		let mut renderer =
 			if let State::Idle { renderer } = std::mem::replace(&mut self.state, State::Empty) {
 				renderer
@@ -214,25 +214,38 @@ impl StreamManager {
 		let (mut unhandled_stream_error_producer, unhandled_stream_error_consumer) =
 			RingBuffer::new(64);
 		let channels = config.channels;
-		let stream = device.build_output_stream(
-			*config,
-			move |data: &mut [f32], _| {
-				#[cfg(feature = "assert_no_alloc")]
-				assert_no_alloc::assert_no_alloc(|| {
+		let stream = device
+			.build_output_stream(
+				*config,
+				move |data: &mut [f32], _| {
+					#[cfg(feature = "assert_no_alloc")]
+					assert_no_alloc::assert_no_alloc(|| {
+						process_renderer(&mut renderer_wrapper, data, channels, sample_rate);
+					});
+					#[cfg(not(feature = "assert_no_alloc"))]
 					process_renderer(&mut renderer_wrapper, data, channels, sample_rate);
-				});
-				#[cfg(not(feature = "assert_no_alloc"))]
-				process_renderer(&mut renderer_wrapper, data, channels, sample_rate);
-			},
-			move |error| match unhandled_stream_error_producer.push(error) {
-				Ok(()) => {}
-				Err(PushError::Full(_stream_error)) => {
-					num_stream_errors_discarded.fetch_add(1, Ordering::AcqRel);
-				}
-			},
-			None,
-		)?;
-		stream.play()?;
+				},
+				move |error| match unhandled_stream_error_producer.push(error) {
+					Ok(()) => {}
+					Err(PushError::Full(_stream_error)) => {
+						num_stream_errors_discarded.fetch_add(1, Ordering::AcqRel);
+					}
+				},
+				None,
+			)
+			.and_then(|stream| {
+				stream.play()?;
+				Ok(stream)
+			});
+		let stream = match stream {
+			Ok(stream) => stream,
+			Err(error) => {
+				// The failed stream owns the callback. Keep its return channel so the
+				// next check can reuse the mixer once the callback has been dropped.
+				self.state = State::Recovering { renderer_consumer };
+				return Err(error);
+			}
+		};
 		self.state = State::Running {
 			stream,
 			renderer_consumer,
@@ -242,16 +255,13 @@ impl StreamManager {
 
 	fn stop_stream(&mut self) {
 		if let State::Running {
-			mut renderer_consumer,
+			renderer_consumer,
 			stream,
 			..
 		} = std::mem::replace(&mut self.state, State::Empty)
 		{
 			drop(stream);
-			let renderer = renderer_consumer
-				.pop()
-				.expect("Could not retrieve the renderer after dropping a stream");
-			self.state = State::Idle { renderer };
+			self.state = State::Recovering { renderer_consumer };
 		} else {
 			panic!("Trying to stop the stream when it's not running")
 		}
